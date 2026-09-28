@@ -1,5 +1,5 @@
 {..............................................................................}
-{  Altium_Schematic_Groupper.pas                                        v1.0  }
+{  Altium_Schematic_Groupper.pas                                        v1.1  }
 {                                                                              }
 {  Groups PCB footprints by the schematic sheet they came from, so a freshly  }
 {  imported design can be tackled one sheet at a time instead of hunting      }
@@ -31,15 +31,17 @@
 {  (see cLabelLayerNo below) so they never touch a fab layer. Delete or hide  }
 {  that layer once you are done placing - it is a work aid, not board data.  }
 {                                                                              }
-{  NOTE: this script was built the same way as Altium_Ez_Panelizer.pas - by  }
-{  matching known-working DelphiScript idioms and confirming the newer API   }
-{  calls (SchIterator_*, DM_LogicalDocuments, GetPcbComponentByRefDes) exist  }
-{  in ScriptingSystem.dll. A first run left the PCB document stuck refusing  }
-{  edits - a dangling BeginModify with no matching EndModify when MoveToXY   }
-{  threw for one footprint - fixed by moving EndModify into a Finally (see   }
-{  ClusterSheet). If Run Script ever drops this file from its list outright, }
-{  that means a property or type elsewhere in here does not compile on your  }
-{  build; everything moved is a single Undo (Ctrl+Z) away from reverting.    }
+{  UNDO: every footprint move and every box line/label is its own undo step, }
+{  so a full revert by Ctrl+Z takes many presses. Save before running; the   }
+{  quickest full revert is closing the PCB without saving. Ctrl+Z does not   }
+{  touch the Mechanical 16 layer setup or its colour (a global preference).  }
+{                                                                              }
+{  NOTE: built by matching DelphiScript idioms already proven in             }
+{  Altium_EZ_Panelizer (github.com/AlpagutSencer/Altium_EZ_Panelizer) and    }
+{  confirming the newer API calls (SchIterator_*, DM_LogicalDocuments,       }
+{  GetPcbComponentByRefDes) exist in ScriptingSystem.dll. If Run Script ever }
+{  drops this file from its list outright, a property or type in here does   }
+{  not compile on your Altium build.                                         }
 {..............................................................................}
 
 Const
@@ -115,17 +117,34 @@ Begin
 End;
 
 
-{  Bounding box of the board outline, by scanning its vertices directly -    }
-{  same proven approach as reading a source board's outline: exact for the   }
-{  purpose (a staging-area reference point), and arcs are close enough as    }
-{  their chord since BoardOutline.Segments is already a fine polyline.       }
+{  Bounding box of the board outline. The outline's own BoundingRectangle   }
+{  includes arc bulges, so it is tried first. The fallback scans the         }
+{  segment end points only, which can miss how far an arc edge bulges out -  }
+{  acceptable for a staging-area reference, since cStagingGapMM leaves room. }
 {..............................................................................}
 Function BoardBBox(Board : IPCB_Board; Var X1, Y1, X2, Y2 : TCoord) : Boolean;
 Var
     i, n   : Integer;
     vx, vy : TCoord;
+    R      : TCoordRect;
 Begin
     Result := False;
+    // No Exit inside Try here: kept to the plain constructs this script
+    // already relies on, since one the interpreter rejects drops the whole
+    // script from Run Script.
+    Try
+        R := Board.BoardOutline.BoundingRectangle;
+        If (R.x2 > R.x1) And (R.y2 > R.y1) Then
+        Begin
+            X1 := R.x1;  Y1 := R.y1;
+            X2 := R.x2;  Y2 := R.y2;
+            Result := True;
+        End;
+    Except
+        Result := False;
+    End;
+    If Result Then Exit;
+
     n := Board.BoardOutline.PointCount;
     If n < 3 Then Exit;
 
@@ -183,13 +202,21 @@ End;
 {  BuildPanel uses to seat the embedded board array exactly on (OX, OY)       }
 {  rather than trust what MoveToXY's anchor turns out to be.                  }
 {..............................................................................}
+{                                                                              }
+{  Seen holds every designator an earlier sheet already claimed: a part      }
+{  whose sub-parts sit on two sheets stays in the first sheet's group rather  }
+{  than being pulled again into the next one. Returns the number of          }
+{  footprints actually moved, not merely found.                               }
+{..............................................................................}
 Function ClusterSheet(Board : IPCB_Board; Designators : TStringList;
+                      Seen : TStringList;
                       StartX : TCoord; Var TopY : TCoord;
                       SheetLabel : String; LabelLayer : TLayer;
                       Var Report : String) : Integer;
 Var
     Comps          : Array[0..cMaxComps - 1] Of IPCB_Component;
-    N, i           : Integer;
+    Names          : Array[0..cMaxComps - 1] Of String;
+    N, i, Moved    : Integer;
     Comp           : IPCB_Component;
     CW, CH         : TCoord;
     Gap            : TCoord;
@@ -201,21 +228,30 @@ Var
     R              : TCoordRect;
     BoxX1, BoxY1, BoxX2, BoxY2 : TCoord;
 Begin
-    N := 0;
+    N      := 0;
+    Moved  := 0;
+    Result := 0;
     For i := 0 To Designators.Count - 1 Do
     Begin
-        Comp := Board.GetPcbComponentByRefDes(Designators[i]);
-        If Comp = Nil Then
+        If Seen.IndexOf(Designators[i]) >= 0 Then
             Report := Report + '  - ' + Designators[i] + ' (' + SheetLabel +
-                      ': no footprint on the PCB)' + #13#10
-        Else If N < cMaxComps Then
+                      ': also on an earlier sheet, left in that sheet''s group)' + #13#10
+        Else
         Begin
-            Comps[N] := Comp;
-            Inc(N);
+            Seen.Add(Designators[i]);
+            Comp := Board.GetPcbComponentByRefDes(Designators[i]);
+            If Comp = Nil Then
+                Report := Report + '  - ' + Designators[i] + ' (' + SheetLabel +
+                          ': no footprint on the PCB)' + #13#10
+            Else If N < cMaxComps Then
+            Begin
+                Comps[N] := Comp;
+                Names[N] := Designators[i];
+                Inc(N);
+            End;
         End;
     End;
 
-    Result := N;
     If N = 0 Then Exit;
 
     Gap        := MM(cCellGapMM);
@@ -277,15 +313,18 @@ Begin
                             Comps[i].MoveToXY(CX + DX, CY + DY);
                     Except
                     End;
+                    // Selected only so the final zoom can frame the result;
+                    // the whole board is deselected again after the zoom.
                     Comps[i].Selected := True;
+                    Inc(Moved);
                 Finally
                     PCBServer.SendMessageToRobots(Comps[i].I_ObjectAddress,
                                                   c_Broadcast, PCBM_EndModify,
                                                   c_NoEventData);
                 End;
             Except
-                Report := Report + '  - ' + SheetLabel +
-                          ': a footprint could not be moved, skipped' + #13#10;
+                Report := Report + '  - ' + Names[i] + ' (' + SheetLabel +
+                          ': could not be moved, left where it was)' + #13#10;
             End;
 
             RowX := RowX + CW + Gap;
@@ -296,6 +335,7 @@ Begin
         PCBServer.PostProcess;
     End;
 
+    Result := Moved;
     GroupBottom := RowTop - RowH;
 
     // ---- box + label, decorative only: never worth losing the move over ----
@@ -344,6 +384,7 @@ Var
     IterGuard    : Integer;
     SComp        : ISch_Component;
     Designators  : TStringList;
+    Seen         : TStringList;
     LabelLayer   : TLayer;
     MLayer       : IPCB_LayerObject;
     BX1, BY1, BX2, BY2 : TCoord;
@@ -414,7 +455,10 @@ Begin
                         'Anything already placed on the board gets pulled off ' +
                         'it too, since matching is by designator alone, not by ' +
                         'current position.' + #13#10 + #13#10 +
-                        'This can be undone with Ctrl+Z.' + #13#10 + #13#10 +
+                        'Every move is its own undo step, so reverting with ' +
+                        'Ctrl+Z takes many presses. Save the board first: ' +
+                        'closing it without saving is the quickest full ' +
+                        'revert.' + #13#10 + #13#10 +
                         'Continue?') Then Exit;
 
     // ---------- 2. spare mechanical layer for the group boxes/labels ----------
@@ -464,6 +508,12 @@ Begin
     TotalPlaced := 0;
     Report      := '';
     Breakdown   := '';
+
+    // Designators already claimed by an earlier sheet (see ClusterSheet).
+    Seen := TStringList.Create;
+    Seen.Sorted     := True;
+    Seen.Duplicates := dupIgnore;
+    Try
 
     // ---------- 3. one cluster per schematic sheet ----------
     // PCBServer.PreProcess/PostProcess is NOT held open across this whole loop
@@ -531,16 +581,17 @@ Begin
                             Inc(SheetsEmpty)
                         Else
                         Begin
-                            Placed := ClusterSheet(Board, Designators, StartX,
-                                                   TopY, SheetLabel, LabelLayer,
-                                                   Report);
+                            Placed := ClusterSheet(Board, Designators, Seen,
+                                                   StartX, TopY, SheetLabel,
+                                                   LabelLayer, Report);
                             If Placed > 0 Then
                             Begin
                                 Inc(SheetsUsed);
                                 TotalPlaced := TotalPlaced + Placed;
                                 Breakdown := Breakdown + '  - ' + SheetLabel +
                                              ': ' + IntToStr(Placed) + ' of ' +
-                                             IntToStr(Designators.Count) + #13#10;
+                                             IntToStr(Designators.Count) +
+                                             ' moved' + #13#10;
                             End
                             Else
                                 Inc(SheetsEmpty);
@@ -555,13 +606,22 @@ Begin
                       ': failed, skipped' + #13#10;
         End;
     End;
+    Finally
+        Seen.Free;
+    End;
 
     // ---------- 4. back to the PCB, fit the result ----------
+    // Everything moved is still selected, which is what lets PCB:Zoom frame
+    // it. Deselect afterwards: left selected, every cluster from every sheet
+    // would move together, so each can be picked up on its own instead.
     Try
         Client.ShowDocument(PCBDoc);
         ResetParameters;
         AddStringParameter('Action', 'Selected');
         RunProcess('PCB:Zoom');
+        ResetParameters;
+        AddStringParameter('Scope', 'All');
+        RunProcess('PCB:DeSelect');
         Board.ViewManager_UpdateLayerTabs;
         Board.GraphicalView_ZoomRedraw;
     Except
@@ -581,8 +641,10 @@ Begin
                 'once you are done placing. Note: the yellow is an Altium ' +
                 'preference for Mechanical ' + IntToStr(cLabelLayerNo) +
                 ', not something stored in this board - it will show up ' +
-                'that colour in other projects too.' + #13#10 +
-                'Everything moved is a single Ctrl+Z away from reverting.' +
+                'that colour in other projects too.' + #13#10 + #13#10 +
+                'To move a group, drag a selection window around its box. ' +
+                'To revert everything, close the board without saving; ' +
+                'Ctrl+Z works too but takes one press per move.' +
                 Report);
 End;
 
